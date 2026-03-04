@@ -98,4 +98,4 @@ jobs:
           git config user.email "venkatavinod0896@gmail.com"
           git add my-web-app/deployment.yaml
           git commit -m "Update image to $IMAGE_TAG" || echo "No changes to commit"
-          git push
+          git push origin main
