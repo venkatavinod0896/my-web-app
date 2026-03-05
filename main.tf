@@ -60,9 +60,6 @@ module "eks" {
   cluster_encryption_config = []
   create_kms_key            = false
 
-  # ✅ add this line
-  enable_cluster_creator_admin_permissions = true
-
   # ✅ IMPORTANT: Allow kubectl access by managing aws-auth
   manage_aws_auth_configmap = true
 
