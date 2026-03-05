@@ -56,9 +56,20 @@ module "eks" {
 
   cluster_endpoint_public_access = true
 
-  # ✅ disable encryption + stop creating kms key
+  # ✅ Disable encryption + stop creating KMS key (fix KMS DescribeKey issue)
   cluster_encryption_config = []
   create_kms_key            = false
+
+  # ✅ IMPORTANT: Allow kubectl access by managing aws-auth
+  manage_aws_auth_configmap = true
+
+  aws_auth_users = [
+    {
+      userarn  = "arn:aws:iam::527769887303:root"
+      username = "root"
+      groups   = ["system:masters"]
+    }
+  ]
 
   cluster_addons = {
     coredns    = {}
