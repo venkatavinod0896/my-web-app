@@ -3,19 +3,15 @@ kind: Ingress
 metadata:
   name: my-web-app
   annotations:
-    kubernetes.io/ingress.class: alb
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
 
-    # HTTPS
     alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:527769887303:certificate/0842c591-4640-433a-8206-8306de57e1a0
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
     alb.ingress.kubernetes.io/ssl-redirect: "443"
-
-    # Health check
     alb.ingress.kubernetes.io/healthcheck-path: "/"
-
 spec:
+  ingressClassName: alb
   rules:
     - host: shop.katakamdevopsplatform.com
       http:
