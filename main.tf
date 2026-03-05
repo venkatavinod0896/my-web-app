@@ -56,8 +56,8 @@ module "eks" {
 
   cluster_endpoint_public_access = true
 
-  # ✅ Disable encryption + KMS key creation
-  cluster_encryption_config = {}
+  # ✅ disable encryption + stop creating kms key
+  cluster_encryption_config = []
   create_kms_key            = false
 
   cluster_addons = {
