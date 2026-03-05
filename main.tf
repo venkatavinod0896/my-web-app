@@ -1,7 +1,6 @@
 ############################################
 # VPC Module
 ############################################
-
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "5.0.0"
@@ -27,6 +26,7 @@ module "vpc" {
   enable_nat_gateway   = true
   single_nat_gateway   = true
   enable_dns_hostnames = true
+  enable_dns_support   = true
 
   public_subnet_tags = {
     "kubernetes.io/role/elb" = "1"
@@ -37,25 +37,27 @@ module "vpc" {
   }
 
   tags = {
-    Environment = "dev"
+    Environment = var.environment
   }
 }
 
 ############################################
 # EKS Module
 ############################################
-
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "19.15.3"
 
   cluster_name    = var.cluster_name
-  cluster_version = "1.28"   # ✅ Keep same version (No downgrade)
+  cluster_version = "1.28"
 
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.private_subnets
 
   cluster_endpoint_public_access = true
+
+  # ✅ Fix for your error: disable encryption so no KMS DescribeKey needed
+  cluster_encryption_config = {}
 
   cluster_addons = {
     coredns    = {}
@@ -66,8 +68,7 @@ module "eks" {
   eks_managed_node_groups = {
     general = {
       instance_types = ["t3.medium"]
-
-      ami_type = "AL2_x86_64"   # ✅ IMPORTANT FIX
+      ami_type       = "AL2_x86_64"
 
       min_size     = 2
       max_size     = 4
@@ -78,6 +79,6 @@ module "eks" {
   }
 
   tags = {
-    Environment = "dev"
+    Environment = var.environment
   }
 }
