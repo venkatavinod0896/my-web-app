@@ -1,0 +1,163 @@
+name: Phase3-GitOps-CI-CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/**'
+      - 'k8s-manifests/**'
+      - '.github/workflows/ci-cd-gitops.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  detect-changes:
+    runs-on: windows-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed services
+        id: detect
+        shell: pwsh
+        run: |
+          $changedFiles = git diff --name-only HEAD~1 HEAD
+          Write-Host "Changed files:"
+          $changedFiles | ForEach-Object { Write-Host $_ }
+
+          $services = @()
+          $knownServices = @(
+            "product-service",
+            "cart-service",
+            "user-service",
+            "order-service",
+            "payment-service"
+          )
+
+          foreach ($svc in $knownServices) {
+            $matched = $changedFiles | Where-Object {
+              $_ -like "services/$svc/*" -or $_ -like "services/$svc/**"
+            }
+            if ($matched) {
+              $services += $svc
+            }
+          }
+
+          $services = $services | Sort-Object -Unique
+
+          if ($services.Count -eq 0) {
+            "has_changes=false" >> $env:GITHUB_OUTPUT
+            "matrix={""service"":[]}" >> $env:GITHUB_OUTPUT
+            Write-Host "No service code changes found."
+          }
+          else {
+            $json = @{ service = $services } | ConvertTo-Json -Compress
+            "has_changes=true" >> $env:GITHUB_OUTPUT
+            "matrix=$json" >> $env:GITHUB_OUTPUT
+            Write-Host "Matrix JSON: $json"
+          }
+
+  build-push-update:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image variables
+        id: vars
+        shell: pwsh
+        run: |
+          $service = "${{ matrix.service }}"
+          $shortSha = "${{ github.sha }}".Substring(0,7)
+          $imageUri = "${{ secrets.ECR_REGISTRY }}/$service:$shortSha"
+
+          "service=$service" >> $env:GITHUB_OUTPUT
+          "short_sha=$shortSha" >> $env:GITHUB_OUTPUT
+          "image_uri=$imageUri" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Service   : $service"
+          Write-Host "Short SHA : $shortSha"
+          Write-Host "Image URI : $imageUri"
+
+      - name: Build Docker image
+        shell: pwsh
+        run: |
+          $service = "${{ steps.vars.outputs.service }}"
+          $imageUri = "${{ steps.vars.outputs.image_uri }}"
+
+          docker build -t $imageUri ".\services\$service"
+
+      - name: Push Docker image
+        shell: pwsh
+        run: |
+          $imageUri = "${{ steps.vars.outputs.image_uri }}"
+          docker push $imageUri
+
+      - name: Update Kubernetes deployment manifest
+        shell: pwsh
+        run: |
+          $service = "${{ steps.vars.outputs.service }}"
+          $imageUri = "${{ steps.vars.outputs.image_uri }}"
+          $file = ".\k8s-manifests\$service\deployment.yaml"
+
+          if (!(Test-Path $file)) {
+            throw "Deployment file not found: $file"
+          }
+
+          $content = Get-Content $file -Raw
+
+          $pattern = 'image:\s*.*'
+          $replacement = "image: $imageUri"
+
+          $updated = [regex]::Replace($content, $pattern, $replacement, 1)
+
+          Set-Content -Path $file -Value $updated -NoNewline
+
+          Write-Host "Updated manifest file: $file"
+          Get-Content $file
+
+      - name: Commit and push GitOps manifest change
+        shell: pwsh
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+
+          git add k8s-manifests
+
+          $service = "${{ steps.vars.outputs.service }}"
+          $shortSha = "${{ steps.vars.outputs.short_sha }}"
+
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "No manifest changes to commit."
+            exit 0
+          }
+
+          git commit -m "gitops: update $service image to $shortSha"
+          git push
