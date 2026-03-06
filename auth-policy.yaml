@@ -1,0 +1,14 @@
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: payment-access
+  namespace: ecommerce
+spec:
+  selector:
+    matchLabels:
+      app: payment-service
+  rules:
+  - from:
+    - source:
+        principals:
+        - cluster.local/ns/ecommerce/sa/default
