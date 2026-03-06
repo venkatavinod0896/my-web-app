@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: cart-service
-        image: 527769887303.dkr.ecr.us-east-1.amazonaws.com/cart-service:v1
+        image: 527769887303.dkr.ecr.us-east-1.amazonaws.com/cart-service:git-f07e00f7a615de7a65f48986df0d2be5dd7f4f92
         imagePullPolicy: Always
         ports:
         - containerPort: 5000
