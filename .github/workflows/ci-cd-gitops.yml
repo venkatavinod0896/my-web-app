@@ -1,163 +1,300 @@
-name: Phase3-GitOps-CI-CD
+name: Full CI-CD GitOps Pipeline
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - 'k8s-manifests/**'
+      - 'argocd/**'
   push:
     branches:
       - main
-    paths:
-      - 'services/**'
+    paths-ignore:
       - 'k8s-manifests/**'
-      - '.github/workflows/ci-cd-gitops.yml'
+      - 'argocd/**'
   workflow_dispatch:
+
+concurrency:
+  group: gitops-deploy-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   id-token: write
   contents: write
+  pull-requests: read
+
+env:
+  AWS_REGION: us-east-1
 
 jobs:
   detect-changes:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.detect.outputs.matrix }}
       has_changes: ${{ steps.detect.outputs.has_changes }}
+      tf_changed: ${{ steps.tf.outputs.terraform }}
+
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
+
+      - name: Detect Terraform changes
+        id: tf
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            terraform:
+              - '**/*.tf'
+              - '**/*.tfvars'
+              - 'backend.tf'
+              - 'providers.tf'
+              - 'variables.tf'
+              - 'outputs.tf'
+              - '.terraform.lock.hcl'
 
       - name: Detect changed services
         id: detect
-        shell: pwsh
+        shell: bash
         run: |
-          $changedFiles = git diff --name-only HEAD~1 HEAD
-          Write-Host "Changed files:"
-          $changedFiles | ForEach-Object { Write-Host $_ }
+          set -e
 
-          $services = @()
-          $knownServices = @(
-            "product-service",
-            "cart-service",
-            "user-service",
-            "order-service",
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.sha }}"
+          fi
+
+          echo "Base SHA: $BASE_SHA"
+          echo "Head SHA: $HEAD_SHA"
+
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" || true)
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          SERVICES=()
+
+          KNOWN_SERVICES=(
+            "product-service"
+            "cart-service"
+            "user-service"
+            "order-service"
             "payment-service"
           )
 
-          foreach ($svc in $knownServices) {
-            $matched = $changedFiles | Where-Object {
-              $_ -like "services/$svc/*" -or $_ -like "services/$svc/**"
-            }
-            if ($matched) {
-              $services += $svc
-            }
-          }
+          for svc in "${KNOWN_SERVICES[@]}"; do
+            if echo "$CHANGED_FILES" | grep -qE "^services/${svc}/|^${svc}/"; then
+              SERVICES+=("$svc")
+            fi
+          done
 
-          $services = $services | Sort-Object -Unique
+          if [ ${#SERVICES[@]} -eq 0 ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo 'matrix={"service":[]}' >> "$GITHUB_OUTPUT"
+            echo "No service code changes found."
+          else
+            JSON=$(printf '%s\n' "${SERVICES[@]}" | jq -R . | jq -cs '{service: .}')
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
+            echo "Matrix JSON: $JSON"
+          fi
 
-          if ($services.Count -eq 0) {
-            "has_changes=false" >> $env:GITHUB_OUTPUT
-            "matrix={""service"":[]}" >> $env:GITHUB_OUTPUT
-            Write-Host "No service code changes found."
-          }
-          else {
-            $json = @{ service = $services } | ConvertTo-Json -Compress
-            "has_changes=true" >> $env:GITHUB_OUTPUT
-            "matrix=$json" >> $env:GITHUB_OUTPUT
-            Write-Host "Matrix JSON: $json"
-          }
-
-  build-push-update:
+  pr-validate:
     needs: detect-changes
-    if: needs.detect-changes.outputs.has_changes == 'true'
-    runs-on: windows-latest
+    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
 
     steps:
-      - name: Checkout
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build Docker Image for PR Validation
+        shell: bash
+        run: |
+          set -e
+          SERVICE="${{ matrix.service }}"
+          IMAGE_TAG="${SERVICE}-pr-${{ github.sha }}"
+
+          echo "Validating Docker build for $SERVICE"
+
+          if [ -d "./services/$SERVICE" ]; then
+            docker build -t "$IMAGE_TAG" "./services/$SERVICE"
+          elif [ -d "./$SERVICE" ]; then
+            docker build -t "$IMAGE_TAG" "./$SERVICE"
+          else
+            echo "Service folder not found for $SERVICE"
+            exit 1
+          fi
+
+  terraform-pr-validate:
+    needs: detect-changes
+    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.tf_changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  main-deploy:
+    needs: detect-changes
+    if: github.event_name == 'push' && needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+
+    steps:
+      - name: Checkout Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: ${{ secrets.AWS_REGION }}
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify Identity
+        run: aws sts get-caller-identity
 
       - name: Login to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set image variables
+      - name: Set variables
         id: vars
-        shell: pwsh
+        shell: bash
         run: |
-          $service = "${{ matrix.service }}"
-          $shortSha = "${{ github.sha }}".Substring(0,7)
-          $imageUri = "${{ secrets.ECR_REGISTRY }}/$service:$shortSha"
+          set -e
+          SERVICE="${{ matrix.service }}"
+          FULL_SHA="${{ github.sha }}"
+          SHORT_SHA="${FULL_SHA::7}"
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          IMAGE_URI="${REGISTRY}/${SERVICE}:git-${FULL_SHA}"
 
-          "service=$service" >> $env:GITHUB_OUTPUT
-          "short_sha=$shortSha" >> $env:GITHUB_OUTPUT
-          "image_uri=$imageUri" >> $env:GITHUB_OUTPUT
+          echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+          echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
 
-          Write-Host "Service   : $service"
-          Write-Host "Short SHA : $shortSha"
-          Write-Host "Image URI : $imageUri"
+          echo "Service   : $SERVICE"
+          echo "Image URI : $IMAGE_URI"
 
-      - name: Build Docker image
-        shell: pwsh
+      - name: Build Docker Image
+        shell: bash
         run: |
-          $service = "${{ steps.vars.outputs.service }}"
-          $imageUri = "${{ steps.vars.outputs.image_uri }}"
+          set -e
+          SERVICE="${{ steps.vars.outputs.service }}"
+          IMAGE_URI="${{ steps.vars.outputs.image_uri }}"
 
-          docker build -t $imageUri ".\services\$service"
+          if [ -d "./services/$SERVICE" ]; then
+            docker build -t "$IMAGE_URI" "./services/$SERVICE"
+          elif [ -d "./$SERVICE" ]; then
+            docker build -t "$IMAGE_URI" "./$SERVICE"
+          else
+            echo "Service folder not found for $SERVICE"
+            exit 1
+          fi
 
-      - name: Push Docker image
-        shell: pwsh
+      - name: Push Docker Image
+        shell: bash
         run: |
-          $imageUri = "${{ steps.vars.outputs.image_uri }}"
-          docker push $imageUri
+          set -e
+          IMAGE_URI="${{ steps.vars.outputs.image_uri }}"
+          docker push "$IMAGE_URI"
 
-      - name: Update Kubernetes deployment manifest
-        shell: pwsh
+      - name: Update Kubernetes Manifest
+        shell: bash
         run: |
-          $service = "${{ steps.vars.outputs.service }}"
-          $imageUri = "${{ steps.vars.outputs.image_uri }}"
-          $file = ".\k8s-manifests\$service\deployment.yaml"
+          set -e
+          SERVICE="${{ steps.vars.outputs.service }}"
+          IMAGE_URI="${{ steps.vars.outputs.image_uri }}"
+          FILE="k8s-manifests/${SERVICE}/deployment.yaml"
 
-          if (!(Test-Path $file)) {
-            throw "Deployment file not found: $file"
-          }
+          if [ ! -f "$FILE" ]; then
+            echo "Deployment file not found: $FILE"
+            exit 1
+          fi
 
-          $content = Get-Content $file -Raw
+          sed -i -E "0,/^[[:space:]]*image:[[:space:]]*.*/s|^[[:space:]]*image:[[:space:]]*.*|        image: ${IMAGE_URI}|" "$FILE"
 
-          $pattern = 'image:\s*.*'
-          $replacement = "image: $imageUri"
+          echo "Updated $FILE"
+          cat "$FILE"
 
-          $updated = [regex]::Replace($content, $pattern, $replacement, 1)
-
-          Set-Content -Path $file -Value $updated -NoNewline
-
-          Write-Host "Updated manifest file: $file"
-          Get-Content $file
-
-      - name: Commit and push GitOps manifest change
-        shell: pwsh
+      - name: Commit and Push Manifest
+        shell: bash
         run: |
+          set -e
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
 
           git add k8s-manifests
 
-          $service = "${{ steps.vars.outputs.service }}"
-          $shortSha = "${{ steps.vars.outputs.short_sha }}"
-
-          git diff --cached --quiet
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "No manifest changes to commit."
+          if git diff --cached --quiet; then
+            echo "No manifest changes to commit."
             exit 0
-          }
+          fi
 
-          git commit -m "gitops: update $service image to $shortSha"
-          git push
+          SERVICE="${{ steps.vars.outputs.service }}"
+          FULL_SHA="${{ steps.vars.outputs.full_sha }}"
+
+          git commit -m "gitops: update ${SERVICE} image to git-${FULL_SHA} [skip ci]"
+          git push origin main
+
+  terraform-main-apply:
+    needs: detect-changes
+    if: github.event_name == 'push' && needs.detect-changes.outputs.tf_changed == 'true'
+    runs-on: ubuntu-latest
+
+    env:
+      CLUSTER_NAME: gitops-eks
+      VPC_CIDR: 10.0.0.0/16
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -lock-timeout=5m
+        env:
+          TF_VAR_cluster_name: ${{ env.CLUSTER_NAME }}
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_vpc_cidr: ${{ env.VPC_CIDR }}
+          TF_VAR_environment: dev
